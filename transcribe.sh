@@ -12,32 +12,35 @@ Modes:
   native        Use local whisperx binary in PATH/venv
 
 Options:
-  -j, --jobs N              CPU parallelism for ffmpeg cleaning (default: nproc)
-  --whisper-jobs N          Parallelism for whisper step (default: 1; not recommended >1)
-  --input-dir DIR           Input directory (default: current directory)
-  --clean-dir DIR           Clean WAV output directory (default: ./clean)
-  --output-dir DIR          WhisperX output directory (default: ./output)
-  --filter STR              Override ffmpeg -af filter chain
-  --model NAME              WhisperX model (default: large-v2)
-  --device DEV              WhisperX device (default: cuda)
-  --compute-type TYPE       WhisperX compute type (default: float16)
-  --batch-size N            WhisperX batch size (default: 16)
-  --diarize                 Enable diarization (default: on)
-  --no-diarize              Disable diarization
-  --skip-clean-existing     Skip ffmpeg if cleaned WAV already exists
+  -j, --jobs N                 CPU parallelism for ffmpeg cleaning (default: nproc)
+  --whisper-jobs N             Parallelism for whisper step (default: 1; not recommended >1)
+  --input-dir DIR              Input directory (default: cwd)
+  --clean-dir DIR              Clean WAV output directory (default: ./clean)
+  --output-dir DIR             WhisperX output directory (default: ./output)
+  --filter STR                 Override ffmpeg -af filter chain
+  --model NAME                 WhisperX model (default: large-v2)
+  --device DEV                 WhisperX device (default: cuda)
+  --compute-type TYPE          WhisperX compute type (default: float16)
+  --batch-size N               WhisperX batch size (default: 16)
+  --diarize                    Enable diarization (default: on)
+  --no-diarize                 Disable diarization
+
+  --skip-clean-existing         Skip ffmpeg when clean wav exists AND metadata matches (filter hash + input mtime/size)
+  --force-clean                 Always re-run ffmpeg cleaning (overrides skip-clean-existing)
+  --skip-transcribe-existing    Skip whisperx when output JSON or SRT already exists
 
 Docker options (mode=docker):
-  --docker-image NAME       Docker image (default: whisperx:torch241-cu121)
-  --docker-cache DIR        Host cache dir for HF/torch models (default: ~/.cache/whisperx-docker)
-  --docker-runner PATH      Path to run_whisperx_docker.sh (default: ./run_whisperx_docker.sh)
+  --docker-image NAME          Docker image (default: whisperx:torch241-cu121)
+  --docker-cache DIR           Host cache dir for HF/torch models (default: ~/.cache/whisperx-docker)
+  --docker-runner PATH         Path to run_whisperx_docker.sh (default: ./run_whisperx_docker.sh)
 
 Environment:
-  HUGGINGFACE_TOKEN         Required when diarization is enabled.
+  HUGGINGFACE_TOKEN            Required when diarization is enabled.
 
 Examples:
-  transcribe.sh m4a -j 8
-  transcribe.sh docker wav --input-dir . --output-dir ./output
-  transcribe.sh native mp3 --no-diarize
+  transcribe.sh m4a -j 8 --skip-clean-existing --skip-transcribe-existing
+  transcribe.sh docker wav --force-clean
+  transcribe.sh native mp3 --no-diarize --skip-transcribe-existing
 EOF
 }
 
@@ -61,17 +64,13 @@ COMPUTE_TYPE="float16"
 BATCH_SIZE="16"
 DIARIZE=1
 
-SKIP_CLEAN_EXISTING=0
+SKIP_CLEAN_EXISTING=1
+FORCE_CLEAN=0
+SKIP_TRANSCRIBE_EXISTING=0
 
 DOCKER_IMAGE="whisperx:torch241-cu121"
 DOCKER_CACHE="${HOME}/.cache/whisperx-docker"
 DOCKER_RUNNER="./run_whisperx_docker.sh"
-
-if [[ "$MODE" == "docker" && ! -x "$DOCKER_RUNNER" ]]; then
-  if command -v run_whisperx_docker.sh >/dev/null 2>&1; then
-    DOCKER_RUNNER="$(command -v run_whisperx_docker.sh)"
-  fi
-fi
 
 # Parse optional mode
 if [[ $# -lt 1 ]]; then usage; exit 2; fi
@@ -99,7 +98,11 @@ while [[ $# -gt 0 ]]; do
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
     --diarize) DIARIZE=1; shift ;;
     --no-diarize) DIARIZE=0; shift ;;
+
     --skip-clean-existing) SKIP_CLEAN_EXISTING=1; shift ;;
+    --force-clean) FORCE_CLEAN=1; shift ;;
+    --skip-transcribe-existing) SKIP_TRANSCRIBE_EXISTING=1; shift ;;
+
     --docker-image) DOCKER_IMAGE="$2"; shift 2 ;;
     --docker-cache) DOCKER_CACHE="$2"; shift 2 ;;
     --docker-runner) DOCKER_RUNNER="$2"; shift 2 ;;
@@ -124,6 +127,8 @@ fi
 need_cmd ffmpeg
 need_cmd find
 need_cmd xargs
+need_cmd sha256sum
+need_cmd stat
 
 if [[ "$DIARIZE" -eq 1 ]]; then
   : "${HUGGINGFACE_TOKEN:?ERROR: HUGGINGFACE_TOKEN is not set (required for diarization)}"
@@ -134,22 +139,64 @@ if [[ "$MODE" == "docker" ]]; then
   need_cmd docker
   [[ -x "$DOCKER_RUNNER" ]] || { echo "ERROR: docker runner not found/executable: $DOCKER_RUNNER" >&2; exit 1; }
 else
-  # native mode requires whisperx in PATH (venv activated)
   need_cmd whisperx
 fi
 
 mkdir -p "$CLEAN_DIR" "$OUTPUT_DIR"
 
-# Normalize dirs to absolute where useful
 INPUT_DIR_ABS="$(cd "$INPUT_DIR" && pwd)"
 
-# Cleaning step
 echo "Mode: $MODE"
-echo "Cleaning: input=$INPUT_DIR_ABS ext=.$ext jobs=$JOBS"
-echo "Clean dir: $CLEAN_DIR"
-echo "Output dir: $OUTPUT_DIR"
+echo "Input:  $INPUT_DIR_ABS (.$ext)"
+echo "Clean:  $CLEAN_DIR"
+echo "Output: $OUTPUT_DIR"
+echo "ffmpeg jobs=$JOBS, whisper jobs=$WHISPER_JOBS"
+echo "skip-clean=$SKIP_CLEAN_EXISTING force-clean=$FORCE_CLEAN skip-transcribe=$SKIP_TRANSCRIBE_EXISTING"
 
 shopt -s nullglob nocaseglob
+
+# Compute a stable hash for the current filter chain
+FILTER_SHA="$(printf "%s" "$AUDIO_FILTER" | sha256sum | awk '{print $1}')"
+
+meta_path_for() {
+  local out_wav="$1"
+  echo "${out_wav}.meta"
+}
+
+write_clean_meta() {
+  local in="$1"
+  local out="$2"
+  local meta
+  meta="$(meta_path_for "$out")"
+  local sz mt
+  sz="$(stat -c '%s' "$in")"
+  mt="$(stat -c '%Y' "$in")"
+  cat > "$meta" <<EOF
+filter_sha=$FILTER_SHA
+input_size=$sz
+input_mtime=$mt
+EOF
+}
+
+clean_meta_matches() {
+  local in="$1"
+  local out="$2"
+  local meta
+  meta="$(meta_path_for "$out")"
+  [[ -f "$out" && -f "$meta" ]] || return 1
+
+  # shellcheck disable=SC1090
+  source "$meta" || return 1
+
+  local sz mt
+  sz="$(stat -c '%s' "$in")"
+  mt="$(stat -c '%Y' "$in")"
+
+  [[ "${filter_sha:-}" == "$FILTER_SHA" ]] || return 1
+  [[ "${input_size:-}" == "$sz" ]] || return 1
+  [[ "${input_mtime:-}" == "$mt" ]] || return 1
+  return 0
+}
 
 convert_one() {
   local in="$1"
@@ -158,9 +205,14 @@ convert_one() {
   stem="${base%.*}"
   out="${CLEAN_DIR%/}/${stem}_clean.wav"
 
-  if [[ "$SKIP_CLEAN_EXISTING" -eq 1 && -f "$out" ]]; then
-    echo "Skipping clean (exists): $out"
-    return 0
+  if [[ "$FORCE_CLEAN" -eq 0 && "$SKIP_CLEAN_EXISTING" -eq 1 ]]; then
+    if clean_meta_matches "$in" "$out"; then
+      echo "Skipping clean (match): $out"
+      return 0
+    fi
+    if [[ -f "$out" ]]; then
+      echo "Re-cleaning (metadata mismatch or missing): $out"
+    fi
   fi
 
   echo "Cleaning: $in -> $out"
@@ -169,11 +221,25 @@ convert_one() {
     -ac 1 -ar 16000 -c:a pcm_s16le \
     -af "$AUDIO_FILTER" \
     "$out"
+
+  write_clean_meta "$in" "$out"
 }
 
-export -f convert_one
-export AUDIO_FILTER CLEAN_DIR
+output_exists_for_clean_wav() {
+  local w="$1"
+  local base
+  base="$(basename "$w")"
+  base="${base%.*}"  # e.g., foo_clean
 
+  [[ -f "${OUTPUT_DIR%/}/${base}.json" ]] && return 0
+  [[ -f "${OUTPUT_DIR%/}/${base}.srt" ]] && return 0
+  return 1
+}
+
+export -f convert_one write_clean_meta clean_meta_matches meta_path_for output_exists_for_clean_wav
+export AUDIO_FILTER CLEAN_DIR FILTER_SHA SKIP_CLEAN_EXISTING FORCE_CLEAN OUTPUT_DIR SKIP_TRANSCRIBE_EXISTING
+
+# Cleaning step (parallel)
 num_inputs="$(find "$INPUT_DIR_ABS" -maxdepth 1 -type f -iname "*.${ext}" | wc -l | tr -d ' ')"
 if [[ "$num_inputs" == "0" ]]; then
   echo "No input files found for extension: .$ext in $INPUT_DIR_ABS"
@@ -184,8 +250,6 @@ find "$INPUT_DIR_ABS" -maxdepth 1 -type f -iname "*.${ext}" -print0 \
   | xargs -0 -I {} -P "$JOBS" bash -c 'convert_one "$@"' _ "{}"
 
 # Whisper step
-echo "WhisperX: jobs=$WHISPER_JOBS model=$WHISPER_MODEL device=$DEVICE compute=$COMPUTE_TYPE batch=$BATCH_SIZE diarize=$DIARIZE"
-
 num_cleaned="$(find "$CLEAN_DIR" -type f -name "*_clean.wav" | wc -l | tr -d ' ')"
 if [[ "$num_cleaned" == "0" ]]; then
   echo "No cleaned wavs found in $CLEAN_DIR (unexpected)."
@@ -194,7 +258,13 @@ fi
 
 transcribe_one_native() {
   local w="$1"
-  echo "Transcribing: $w"
+
+  if [[ "$SKIP_TRANSCRIBE_EXISTING" -eq 1 ]] && output_exists_for_clean_wav "$w"; then
+    echo "Skipping transcribe (exists): $w"
+    return 0
+  fi
+
+  echo "Transcribing (native): $w"
   if [[ "$DIARIZE" -eq 1 ]]; then
     whisperx "$w" \
       --model "$WHISPER_MODEL" \
@@ -216,9 +286,16 @@ transcribe_one_native() {
 
 transcribe_one_docker() {
   local w="$1"
+
+  if [[ "$SKIP_TRANSCRIBE_EXISTING" -eq 1 ]] && output_exists_for_clean_wav "$w"; then
+    echo "Skipping transcribe (exists): $w"
+    return 0
+  fi
+
   echo "Transcribing (docker): $w"
   local diarize_flag="--diarize"
   [[ "$DIARIZE" -eq 0 ]] && diarize_flag="--no-diarize"
+
   "$DOCKER_RUNNER" \
     --image "$DOCKER_IMAGE" \
     --cache-dir "$DOCKER_CACHE" \
@@ -232,7 +309,7 @@ transcribe_one_docker() {
 }
 
 export -f transcribe_one_native transcribe_one_docker
-export WHISPER_MODEL DEVICE COMPUTE_TYPE BATCH_SIZE DIARIZE OUTPUT_DIR DOCKER_IMAGE DOCKER_CACHE DOCKER_RUNNER HUGGINGFACE_TOKEN
+export WHISPER_MODEL DEVICE COMPUTE_TYPE BATCH_SIZE DIARIZE DOCKER_IMAGE DOCKER_CACHE DOCKER_RUNNER HUGGINGFACE_TOKEN
 
 if [[ "$WHISPER_JOBS" -eq 1 ]]; then
   while IFS= read -r -d '' w; do
@@ -243,7 +320,6 @@ if [[ "$WHISPER_JOBS" -eq 1 ]]; then
     fi
   done < <(find "$CLEAN_DIR" -type f -name "*_clean.wav" -print0)
 else
-  # For whisper parallelism, use xargs -P; be careful with GPU memory if mode=docker/native cuda.
   if [[ "$MODE" == "docker" ]]; then
     find "$CLEAN_DIR" -type f -name "*_clean.wav" -print0 \
       | xargs -0 -I {} -P "$WHISPER_JOBS" bash -c 'transcribe_one_docker "$@"' _ "{}"
@@ -254,4 +330,3 @@ else
 fi
 
 echo "Done. Cleaned audio: $CLEAN_DIR   Outputs: $OUTPUT_DIR"
-

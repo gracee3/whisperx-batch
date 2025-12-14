@@ -94,10 +94,25 @@ if [[ "$IN_C" == "ERROR_ABS_OUTSIDE" || "$OUT_C" == "ERROR_ABS_OUTSIDE" ]]; then
   exit 2
 fi
 
-DIARIZE_ARGS=()
+# Build a single shell command string so bash -lc receives the full whisperx invocation.
+cmd=( whisperx "$IN_C"
+  --model "$MODEL"
+  --device "$DEVICE"
+  --compute_type "$COMPUTE_TYPE"
+  --batch_size "$BATCH_SIZE"
+  --output_dir "$OUT_C"
+)
+
 if [[ "$DIARIZE" -eq 1 ]]; then
-  DIARIZE_ARGS+=(--diarize --hf_token "$HUGGINGFACE_TOKEN")
+  cmd+=( --diarize --hf_token "\$HUGGINGFACE_TOKEN" )
 fi
+
+# shell-escape everything safely
+cmd_str=""
+for a in "${cmd[@]}"; do
+  cmd_str+=$(printf " %q" "$a")
+done
+cmd_str="${cmd_str# }"
 
 docker run --rm -i --gpus all \
   -v "${WORKDIR_ABS}:/work" \
@@ -108,11 +123,4 @@ docker run --rm -i --gpus all \
   -e TORCH_HOME=/cache/torch \
   -e XDG_CACHE_HOME=/cache/xdg \
   "$IMAGE" \
-  whisperx "$IN_C" \
-    --model "$MODEL" \
-    --device "$DEVICE" \
-    --compute_type "$COMPUTE_TYPE" \
-    --batch_size "$BATCH_SIZE" \
-    --output_dir "$OUT_C" \
-    "${DIARIZE_ARGS[@]}"
-
+  bash -lc "$cmd_str"

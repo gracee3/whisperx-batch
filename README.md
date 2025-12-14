@@ -3,47 +3,55 @@
 A small, practical toolkit for cleaning audio and batch-transcribing it with
 [WhisperX](https://github.com/m-bain/whisperx).
 
-Designed for:
-- running on local machines with NVIDIA GPUs
+Built for:
+- real-world audio (meetings, lectures, interviews)
 - stable diarization
-- reproducible installs (Docker-first, native optional)
-- batch processing of real-world audio files
+- GPU systems that *shouldn’t* break every time Torch updates
+- fast re-runs without redoing work
 
 Nothing fancy — just stuff that works.
 
 ---
 
-## Features
+## What this does
 
-- Batch audio cleaning with `ffmpeg`
-  - mono, 16kHz PCM WAV
-  - high/low-pass filtering
-  - light denoise + loudness normalization
-- WhisperX transcription with optional diarization
-- Docker-based runtime to avoid CUDA / Torch dependency churn
-- Parallel audio preprocessing
-- Safe handling of filenames with spaces
-- No secrets checked into the repo
+1. Cleans audio with `ffmpeg`
+   - mono, 16 kHz PCM WAV
+   - band-pass filtering
+   - light denoise
+   - loudness normalization
+2. Transcribes with WhisperX
+   - GPU-accelerated
+   - optional diarization
+3. Skips work intelligently on re-runs
+   - cached clean audio (with filter hash validation)
+   - cached transcripts
 
 ---
 
 ## Requirements
 
 ### General
+- Linux
 - `ffmpeg`
-- Bash (Linux / macOS)
-- NVIDIA GPU + drivers (for GPU transcription)
+- Bash
 
-### For Docker mode (recommended)
+### GPU transcription
+- NVIDIA GPU
+- NVIDIA drivers
+
+### Recommended (Docker mode)
 - Docker
-- NVIDIA Container Toolkit (`--gpus all` support)
+- NVIDIA Container Toolkit (`--gpus all`)
 
-### For diarization
-- A Hugging Face token with access to the required models
+### Diarization
+- Hugging Face token with access to required models
 
 ```bash
 export HUGGINGFACE_TOKEN="hf_..."
 ````
+
+> ⚠️ Tokens are **never** stored in this repo or scripts.
 
 ---
 
@@ -77,36 +85,75 @@ transcribe.sh [mode] <wav|m4a|mp3> [options]
 
 ### Modes
 
-* `docker` – use Dockerized WhisperX (default if Docker is available)
-* `native` – use local WhisperX install
+* `docker` – Dockerized WhisperX (default if Docker is available)
+* `native` – Local WhisperX install (advanced users only)
 
-### Common options
+---
+
+## Common options
 
 ```text
--j, --jobs N            ffmpeg parallelism (default: nproc)
---whisper-jobs N        whisper parallelism (default: 1)
---input-dir DIR         input directory (default: cwd)
---clean-dir DIR         cleaned audio dir (default: ./clean)
---output-dir DIR        output dir (default: ./output)
---no-diarize            disable diarization
-```
+-j, --jobs N                     ffmpeg parallelism (default: nproc)
+--whisper-jobs N                 whisper parallelism (default: 1)
+--input-dir DIR                  input directory (default: cwd)
+--clean-dir DIR                  cleaned WAV directory (default: ./clean)
+--output-dir DIR                 transcript output directory (default: ./output)
 
-### Examples
+--skip-clean-existing             skip ffmpeg if cached clean audio is valid
+--force-clean                     force re-cleaning audio
+--skip-transcribe-existing        skip WhisperX if output already exists
 
-```bash
-# Transcribe all .m4a files in the current directory
-transcribe.sh m4a
-
-# Use docker explicitly
-transcribe.sh docker wav
-
-# Faster audio cleaning, no diarization
-transcribe.sh mp3 -j 8 --no-diarize
+--no-diarize                      disable diarization
 ```
 
 ---
 
-## Docker cache (important)
+## Examples
+
+Fast incremental rerun (recommended):
+
+```bash
+transcribe.sh m4a -j 8 \
+  --skip-clean-existing \
+  --skip-transcribe-existing
+```
+
+Force re-clean audio (filter changed, bad denoise, etc.):
+
+```bash
+transcribe.sh wav --force-clean
+```
+
+Docker explicitly:
+
+```bash
+transcribe.sh docker mp3
+```
+
+---
+
+## Caching behavior (important)
+
+### Clean audio cache
+
+For each cleaned file, a sidecar metadata file is written:
+
+```text
+clean/foo_clean.wav
+clean/foo_clean.wav.meta
+```
+
+The `.meta` file records:
+
+* input file size
+* input mtime
+* hash of the ffmpeg filter chain
+
+If any of those change, the file is re-cleaned automatically.
+
+---
+
+### Docker model cache
 
 Models are cached between runs at:
 
@@ -122,26 +169,38 @@ This avoids re-downloading Whisper / Hugging Face models every time.
 
 ```text
 .
-├── transcribe.sh              # main entry point
-├── run_whisperx_docker.sh     # docker runner helper
+├── transcribe.sh
+├── run_whisperx_docker.sh
 ├── Dockerfile.whisperx-cu121-torch241
-├── clean/                     # generated cleaned WAVs
-└── output/                    # transcripts
+├── clean/        # generated (ignored)
+├── output/       # generated (ignored)
+└── README.md
 ```
 
 ---
 
 ## Notes
 
-* Diarization is GPU + CPU heavy — `--whisper-jobs 1` is recommended for stability.
-* The Docker image pins known-good versions of Torch, WhisperX, and CUDA libs.
-* Native mode is supported, but Docker is strongly recommended if you value your time.
+* Diarization is GPU + CPU heavy — `--whisper-jobs 1` is recommended.
+* Docker mode avoids Torch / CUDA dependency churn.
+* Native mode is supported, but Docker is strongly recommended unless you enjoy debugging ML stacks.
 
 ---
 
 ## License
 
-MIT. Use it, modify it, break it, fix it.
+MIT.
 
+Use it, modify it, break it, fix it.
 
+```
 
+---
+
+If you want next:
+- a `CHANGELOG.md`
+- GitHub Actions for linting / shellcheck
+- a `make build / make transcribe` flow
+- badges (CUDA, Docker, WhisperX version)
+
+Just say the word 🙂
