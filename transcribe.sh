@@ -296,7 +296,7 @@ transcribe_one_docker() {
   local diarize_flag="--diarize"
   [[ "$DIARIZE" -eq 0 ]] && diarize_flag="--no-diarize"
 
-  "$DOCKER_RUNNER" \
+  if ! "$DOCKER_RUNNER" \
     --image "$DOCKER_IMAGE" \
     --cache-dir "$DOCKER_CACHE" \
     --workdir "$PWD" \
@@ -306,6 +306,24 @@ transcribe_one_docker() {
     --batch-size "$BATCH_SIZE" \
     $diarize_flag \
     "$w" "$OUTPUT_DIR"
+  then
+    echo "WARN: diarization run failed for $w" >&2
+    if [[ "$DIARIZE" -eq 1 ]]; then
+      echo "Retrying without diarization so outputs are produced..." >&2
+      "$DOCKER_RUNNER" \
+        --image "$DOCKER_IMAGE" \
+        --cache-dir "$DOCKER_CACHE" \
+        --workdir "$PWD" \
+        --model "$WHISPER_MODEL" \
+        --device "$DEVICE" \
+        --compute-type "$COMPUTE_TYPE" \
+        --batch-size "$BATCH_SIZE" \
+        --no-diarize \
+        "$w" "$OUTPUT_DIR"
+    else
+      return 1
+    fi
+  fi
 }
 
 export -f transcribe_one_native transcribe_one_docker

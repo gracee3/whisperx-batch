@@ -123,4 +123,5 @@ docker run --rm -i --gpus all \
   -e TORCH_HOME=/cache/torch \
   -e XDG_CACHE_HOME=/cache/xdg \
   "$IMAGE" \
-  bash -lc "$cmd_str"
+  "$cmd_str"
+
