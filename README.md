@@ -192,15 +192,3 @@ This avoids re-downloading Whisper / Hugging Face models every time.
 MIT.
 
 Use it, modify it, break it, fix it.
-
-```
-
----
-
-If you want next:
-- a `CHANGELOG.md`
-- GitHub Actions for linting / shellcheck
-- a `make build / make transcribe` flow
-- badges (CUDA, Docker, WhisperX version)
-
-Just say the word 🙂
