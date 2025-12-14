@@ -268,6 +268,7 @@ transcribe_one_native() {
   if [[ "$DIARIZE" -eq 1 ]]; then
     whisperx "$w" \
       --model "$WHISPER_MODEL" \
+      --language en \
       --device "$DEVICE" \
       --compute_type "$COMPUTE_TYPE" \
       --batch_size "$BATCH_SIZE" \
@@ -277,6 +278,7 @@ transcribe_one_native() {
   else
     whisperx "$w" \
       --model "$WHISPER_MODEL" \
+      --language en \
       --device "$DEVICE" \
       --compute_type "$COMPUTE_TYPE" \
       --batch_size "$BATCH_SIZE" \
@@ -301,15 +303,18 @@ transcribe_one_docker() {
     --cache-dir "$DOCKER_CACHE" \
     --workdir "$PWD" \
     --model "$WHISPER_MODEL" \
+    --language en \
     --device "$DEVICE" \
     --compute-type "$COMPUTE_TYPE" \
     --batch-size "$BATCH_SIZE" \
     $diarize_flag \
     "$w" "$OUTPUT_DIR"
   then
-    echo "WARN: diarization run failed for $w" >&2
+    echo "ERROR: transcription failed for: $w" >&2
+
+    # Optional: if diarization is on, retry without diarization so you still get transcripts.
     if [[ "$DIARIZE" -eq 1 ]]; then
-      echo "Retrying without diarization so outputs are produced..." >&2
+      echo "Retrying without diarization for: $w" >&2
       "$DOCKER_RUNNER" \
         --image "$DOCKER_IMAGE" \
         --cache-dir "$DOCKER_CACHE" \
@@ -319,12 +324,15 @@ transcribe_one_docker() {
         --compute-type "$COMPUTE_TYPE" \
         --batch-size "$BATCH_SIZE" \
         --no-diarize \
-        "$w" "$OUTPUT_DIR"
-    else
-      return 1
+        "$w" "$OUTPUT_DIR" \
+      || echo "ERROR: retry without diarization also failed for: $w" >&2
     fi
+
+    # IMPORTANT: do not abort the whole batch
+    return 0
   fi
 }
+
 
 export -f transcribe_one_native transcribe_one_docker
 export WHISPER_MODEL DEVICE COMPUTE_TYPE BATCH_SIZE DIARIZE DOCKER_IMAGE DOCKER_CACHE DOCKER_RUNNER HUGGINGFACE_TOKEN

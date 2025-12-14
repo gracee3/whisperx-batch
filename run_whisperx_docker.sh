@@ -37,6 +37,7 @@ COMPUTE_TYPE="float16"
 MODEL="large-v2"
 BATCH_SIZE="16"
 DIARIZE=1
+LANGUAGE="en"
 
 if [[ $# -lt 2 ]]; then usage; exit 2; fi
 
@@ -48,6 +49,7 @@ while [[ $# -gt 0 ]]; do
     --device) DEVICE="$2"; shift 2 ;;
     --compute-type) COMPUTE_TYPE="$2"; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
+    --language) LANGUAGE="$2"; shift 2 ;;
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
     --diarize) DIARIZE=1; shift ;;
     --no-diarize) DIARIZE=0; shift ;;
@@ -97,6 +99,7 @@ fi
 # Build a single shell command string so bash -lc receives the full whisperx invocation.
 cmd=( whisperx "$IN_C"
   --model "$MODEL"
+  --language "$LANGUAGE"
   --device "$DEVICE"
   --compute_type "$COMPUTE_TYPE"
   --batch_size "$BATCH_SIZE"
