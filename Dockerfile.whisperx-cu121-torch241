@@ -1,0 +1,83 @@
+
+# CUDA 12.1 + cuDNN8 runtime (contains libcudnn*.so.8 which ctranslate2/faster-whisper often expect)
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    # cache locations (bind-mount at runtime for persistence)
+    HF_HOME=/cache/hf \
+    TRANSFORMERS_CACHE=/cache/hf \
+    TORCH_HOME=/cache/torch \
+    XDG_CACHE_HOME=/cache/xdg
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3.10 python3.10-venv python3-pip \
+      ffmpeg git ca-certificates \
+      build-essential pkg-config \
+      libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create venv
+RUN python3.10 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+# Upgrade pip tooling
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -U pip setuptools wheel
+
+# ---- Pin Torch stack FIRST (single source) ----
+# This is your known-good combo and avoids the torchvision::nms mismatch.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir \
+      torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
+      --index-url https://download.pytorch.org/whl/cu121
+
+# Verify Torch stack (fail build if broken)
+RUN python - <<'EOF'
+import torch, torchvision, torchaudio
+print("torch:", torch.__version__, "cuda:", torch.version.cuda, "available:", torch.cuda.is_available())
+print("torchvision:", torchvision.__version__)
+print("torchaudio:", torchaudio.__version__)
+EOF
+
+# ---- Install WhisperX WITHOUT allowing it to drag torch~=2.8.0 ----
+# WhisperX 3.7.4 declares torch~=2.8.0 / torchaudio~=2.8.0 in metadata. :contentReference[oaicite:2]{index=2}
+# So: install it with --no-deps and then install the needed deps ourselves.
+ARG WHISPERX_VERSION=3.7.4
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir --no-deps "whisperx==${WHISPERX_VERSION}"
+
+# Install runtime deps explicitly (pinned to avoid churn)
+# Notes:
+# - ctranslate2 4.4.0 is widely used in “cuDNN8 required” stacks; newer combos can chase cuDNN9. :contentReference[oaicite:3]{index=3}
+# - faster-whisper pinned for stability.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir \
+      "ctranslate2==4.4.0" \
+      "faster-whisper==1.2.0" \
+      "transformers>=4.48.0,<5" \
+      "pyannote-audio>=3.3.2,<4" \
+      "numpy>=2.0.2,<2.1.0" \
+      "pandas>=2.2.3,<2.3.0" \
+      "av<16" \
+      "soundfile>=0.12.1" \
+      "nltk>=3.9.1" \
+      "onnxruntime>=1.14,<2" \
+      "tokenizers>=0.13,<1" \
+      "scipy>=1.10" \
+      "scikit-learn>=1.0"
+
+# Optional: keep logs quieter about torchvision in transformers; harmless either way.
+ENV TRANSFORMERS_NO_TORCHVISION=1
+
+WORKDIR /work
+
+# Default entrypoint
+ENTRYPOINT ["bash", "-lc"]
+CMD ["whisperx --help"]
+
+
