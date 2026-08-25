@@ -14,6 +14,8 @@ import subprocess
 import sys
 import time
 import threading
+import platform
+import hashlib
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -21,9 +23,89 @@ import shutil
 from config_utils import load_toml_config
 from script_defaults import resolve_benchmark_defaults
 from benchmark_utils import parse_kv_items, whisper_arg_for_sweep
+from benchmark_core import aggregate_scores, probe_duration, throughput, validate_output_ids
 
 
 DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().parent / "config.local.toml")
+
+
+def command_output(command: Sequence[str]) -> str:
+  try:
+    proc = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+  except (OSError, subprocess.TimeoutExpired):
+    return ""
+  return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def redact_command(command: Sequence[str]) -> List[str]:
+  redacted: List[str] = []
+  hide_next = False
+  for value in command:
+    lowered = value.lower()
+    if hide_next:
+      redacted.append("<redacted>")
+      hide_next = False
+      continue
+    redacted.append("<redacted>" if lowered.startswith(("hf_", "sk-")) else value)
+    if value.startswith("--") and any(word in lowered for word in ("token", "secret", "password", "api-key")):
+      hide_next = True
+  return redacted
+
+
+def environment_snapshot(transcribe_config: str = "") -> Dict[str, object]:
+  repo = Path(__file__).resolve().parent
+  snapshot: Dict[str, object] = {
+    "captured_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "platform": platform.platform(),
+    "python": sys.version.split()[0],
+    "repository_commit": command_output(["git", "-C", str(repo), "rev-parse", "HEAD"]),
+    "repository_status": command_output(["git", "-C", str(repo), "status", "--short"]),
+    "nvidia_smi": command_output(["nvidia-smi", "--query-gpu=index,uuid,name,driver_version,memory.total", "--format=csv,noheader"]),
+    "docker_version": command_output(["docker", "version", "--format", "client={{.Client.Version}} server={{.Server.Version}}"]),
+    "cpu": command_output(["lscpu"]),
+    "memory": command_output(["free", "-b"]),
+  }
+  try:
+    config = load_toml_config(transcribe_config)
+    section = config.get("transcribe", {}) if isinstance(config, dict) else {}
+    image = str(section.get("docker_image", ""))
+    model = Path(str(section.get("model", ""))).expanduser().resolve()
+    snapshot["image"] = image
+    snapshot["image_id_and_digests"] = command_output(["docker", "image", "inspect", image, "--format", "{{.Id}} {{json .RepoDigests}}"])
+    snapshot["model_identifier"] = model.name
+    snapshot["model_files"] = {p.name: p.stat().st_size for p in sorted(model.iterdir()) if p.is_file()}
+    for name in ("config.json", "tokenizer.json", "preprocessor_config.json"):
+      path = model / name
+      if path.is_file():
+        snapshot.setdefault("model_metadata_sha256", {})[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+  except (OSError, TypeError, ValueError):
+    snapshot["runtime_identity_error"] = "could not resolve image/model identity"
+  return snapshot
+
+
+def count_final_hypothesis_tokens(texts: Sequence[str], transcribe_config: str, run_root: Path) -> Tuple[int | None, str]:
+  try:
+    config = load_toml_config(transcribe_config)
+    section = config.get("transcribe", {}) if isinstance(config, dict) else {}
+    model = Path(str(section.get("model", ""))).expanduser().resolve()
+    image = str(section.get("docker_image", "whisperx:torch280-cu128"))
+    tokenizer = model / "tokenizer.json"
+    if not tokenizer.is_file():
+      return None, "unavailable: exact model tokenizer.json not found"
+    input_path = run_root / "hypotheses-for-tokenizer.json"
+    input_path.write_text(json.dumps(list(texts)), encoding="utf-8")
+    code = "import json,sys;from tokenizers import Tokenizer;t=Tokenizer.from_file(sys.argv[1]);print(sum(len(t.encode(x).ids) for x in json.load(open(sys.argv[2]))))"
+    cmd = ["docker", "run", "--rm", "--pull", "never", "-u", f"{__import__('os').getuid()}:{__import__('os').getgid()}",
+      "-v", f"{model}:{model}:ro", "-v", f"{input_path}:{input_path}:ro",
+      "--entrypoint", "python3", image, "-c", code, str(tokenizer), str(input_path)]
+    proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    input_path.unlink(missing_ok=True)
+    if proc.returncode:
+      (run_root / "tokenizer-error.txt").write_text(proc.stderr[-4000:], encoding="utf-8")
+      return None, "unavailable: exact tokenizer invocation failed"
+    return int(proc.stdout.strip()), "post-hoc exact-model final-hypothesis tokenizer; not decoder-kernel throughput"
+  except (OSError, TypeError, ValueError):
+    return None, "unavailable: exact tokenizer invocation failed"
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,8 +120,8 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--ext",
     default=None,
-    choices=["wav"],
-    help="Audio extension to process (without dot). Must be wav for LibriSpeech-style harness workflow.",
+    choices=["wav", "flac"],
+    help="Audio extension to process (without dot); original LibriSpeech FLAC is preferred.",
   )
   parser.add_argument("--transcribe", default=None, help="transcribe executable.")
   parser.add_argument("--output-root", default=None, help="Benchmark output root.")
@@ -105,6 +187,7 @@ def parse_args() -> argparse.Namespace:
     help="Optional CSV destination.",
   )
   parser.add_argument("--limit", type=int, default=None, help="Limit number of runs evaluated (debug).")
+  parser.add_argument("--manifest-only", action="store_true", help="Validate media/references and write a manifest without transcribing.")
   parser.set_defaults(no_diarize=None)
   parser.add_argument(
     "--diarize",
@@ -292,7 +375,7 @@ def build_run_command(
   run_root: Path,
   combo: Dict[str, str],
 ) -> List[str]:
-  output_dir = run_root / "output"
+  output_dir = run_root / "transcripts"
   output_dir.mkdir(parents=True, exist_ok=True)
 
   cmd = [
@@ -373,7 +456,7 @@ def query_gpu_samples(gpu_filter: str) -> List[Dict[str, object]]:
     return []
   cmd = [
     smi,
-    "--query-gpu=index,memory.used,memory.total,utilization.gpu",
+    "--query-gpu=index,uuid,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw,power.limit,clocks.current.graphics,clocks.current.memory",
     "--format=csv,noheader,nounits",
   ]
   if gpu_filter:
@@ -385,9 +468,9 @@ def query_gpu_samples(gpu_filter: str) -> List[Dict[str, object]]:
   samples: List[Dict[str, object]] = []
   for raw in proc.stdout.splitlines():
     parts = [p.strip() for p in raw.split(",")]
-    if len(parts) < 4:
+    if len(parts) < 11:
       continue
-    idx, mem_used, mem_total, util = parts[:4]
+    idx, uuid, name, mem_used, mem_total, util, temperature, power, power_limit, graphics_clock, memory_clock = parts[:11]
     try:
       mem_used_i = int(float(mem_used))
       mem_total_i = int(float(mem_total))
@@ -397,9 +480,16 @@ def query_gpu_samples(gpu_filter: str) -> List[Dict[str, object]]:
     samples.append(
       {
         "index": idx,
+        "uuid": uuid,
+        "name": name,
         "mem_used_mib": mem_used_i,
         "mem_total_mib": mem_total_i,
         "utilization_pct": util_f,
+        "temperature_c": to_float(temperature),
+        "power_w": to_float(power),
+        "power_limit_w": to_float(power_limit),
+        "graphics_clock_mhz": to_float(graphics_clock),
+        "memory_clock_mhz": to_float(memory_clock),
       },
     )
   return samples
@@ -506,13 +596,21 @@ def write_trace_json(
     "returncode": returncode,
     "trace_interval_s": args.trace_interval,
     "runtime_s": runtime_s,
-    "command": cmd,
+    "command": redact_command(cmd),
     "sample_count": len(samples),
     "samples": samples,
     "summary": summary,
   }
   try:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    csv_path = run_root / "gpu-trace.csv"
+    fields = ["timestamp", "index", "uuid", "name", "mem_used_mib", "mem_total_mib", "utilization_pct", "temperature_c", "power_w", "power_limit_w", "graphics_clock_mhz", "memory_clock_mhz"]
+    with csv_path.open("w", newline="", encoding="utf-8") as stream:
+      writer = csv.DictWriter(stream, fieldnames=fields)
+      writer.writeheader()
+      for sample in samples:
+        for gpu in sample.get("gpus", []):
+          writer.writerow({"timestamp": sample.get("ts"), **{key: gpu.get(key, "") for key in fields[1:]}})
   except OSError:
     pass
   return {
@@ -561,19 +659,56 @@ def run_combo(
   combo_idx: int,
   combo: Dict[str, str],
 ) -> Dict[str, object]:
-  run_root = Path(args.output_root) / f"run_{combo_idx:03d}"
-  output_root = run_root / "output"
+  run_root = (Path(args.output_root) / f"run_{combo_idx:03d}").resolve()
+  output_root = run_root / "transcripts"
   run_input = run_root / "input"
   run_input.mkdir(parents=True, exist_ok=True)
+  environment = environment_snapshot(str(args.transcribe_config))
+  (run_root / "environment.json").write_text(json.dumps(environment, indent=2) + "\n", encoding="utf-8")
+
+  runtime_config = load_toml_config(str(args.transcribe_config))
+  transcribe_config = runtime_config.get("transcribe", {}) if isinstance(runtime_config, dict) else {}
+  whisper_config = runtime_config.get("whisper", {}) if isinstance(runtime_config, dict) else {}
+  source_manifest = dataset / "manifest.json"
+  dataset_mode = "standard-librispeech-utterance"
+  if source_manifest.is_file():
+    try:
+      dataset_mode = str(json.loads(source_manifest.read_text(encoding="utf-8")).get("mode", dataset_mode))
+    except (OSError, json.JSONDecodeError):
+      pass
+  no_align_value = combo.get("no-align", str(whisper_config.get("no_align", False))).lower()
+
+  manifest_payload = {
+    "schema_version": 1,
+    "dataset": str(dataset),
+    "extension": args.ext,
+    "items": [
+      {"item_id": audio.stem, "audio_path": str(audio), "reference": ref,
+       "duration_s": args.duration_by_path[str(audio)]}
+      for audio, ref in manifest
+    ],
+  }
+  canonical = json.dumps(manifest_payload["items"], sort_keys=True, separators=(",", ":"))
+  manifest_payload["manifest_sha256"] = hashlib.sha256(canonical.encode()).hexdigest()
+  (run_root / "manifest.json").write_text(json.dumps(manifest_payload, indent=2) + "\n", encoding="utf-8")
 
   for audio, _ in manifest:
     link_name = run_input / audio.relative_to(dataset)
     link_name.parent.mkdir(parents=True, exist_ok=True)
     if link_name.exists() or link_name.is_symlink():
       link_name.unlink()
-    shutil.copy2(audio, link_name)
+    try:
+      link_name.hardlink_to(audio)
+    except OSError:
+      shutil.copy2(audio, link_name)
 
   cmd = build_run_command(args, run_input, run_root, combo)
+  resolved_lines = [
+    f'dataset = {json.dumps(str(dataset))}', f'extension = {json.dumps(args.ext)}',
+    f'batch_size = {args.batch_size}', f'output_format = {json.dumps(args.output_format)}',
+    f'score_format = {json.dumps(args.score_format)}', f'diarize = {str(not args.no_diarize).lower()}',
+  ] + [f'{key.replace("-", "_")} = {json.dumps(value)}' for key, value in sorted(combo.items())]
+  (run_root / "config.resolved.toml").write_text("\n".join(resolved_lines) + "\n", encoding="utf-8")
   gpu_filter = resolve_trace_device_filter(cmd, str(args.transcribe_config), combo)
   trace_samples: List[Dict[str, object]] = []
   trace_thread: threading.Thread | None = None
@@ -589,8 +724,9 @@ def run_combo(
     trace_thread.start()
 
   start = time.perf_counter()
-  proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+  proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
   runtime = time.perf_counter() - start
+  (run_root / "process.log").write_text(proc.stdout or "", encoding="utf-8")
 
   if trace_thread and trace_stop:
     trace_stop.set()
@@ -609,16 +745,30 @@ def run_combo(
 
   base_row = {
     "run_id": run_root.name,
+    "dataset": str(dataset),
+    "dataset_mode": dataset_mode,
+    "model": Path(str(transcribe_config.get("model", ""))).name,
+    "compute_type": str(transcribe_config.get("compute_type", "")),
+    "alignment_enabled": no_align_value not in {"true", "1", "yes", "on"},
+    "diarization_enabled": not args.no_diarize,
+    "batch_size": int(combo.get("batch-size", args.batch_size)),
+    "beam_size": int(combo.get("beam-size", whisper_config.get("beam_size", 1))),
+    "gpu_devices": gpu_filter,
+    "repository_commit": environment.get("repository_commit", ""),
+    "image_identity": environment.get("image_id_and_digests", ""),
+    "timing_boundary": "transcribe child process start through child exit; excludes manifest preparation and scoring",
+    "cache_policy": "operator-controlled cache; process starts cold; cache is not cleared by the harness",
     "runtime_s": runtime,
     "num_files": len(manifest),
     "files_per_second": (len(manifest) / runtime) if runtime > 0 else 0.0,
     "seconds_per_file": (runtime / len(manifest)) if manifest else 0.0,
-    "input_toks_per_sec_avg": 0.0,
-    "input_toks_per_sec_peak": 0.0,
-    "decode_toks_per_sec_avg": 0.0,
-    "decode_toks_per_sec_peak": 0.0,
-    "encode_toks_per_sec_avg": 0.0,
-    "encode_toks_per_sec_peak": 0.0,
+    "corpus_wer": None, "macro_wer": None,
+    "substitutions": 0, "deletions": 0, "insertions": 0, "hits": 0,
+    "reference_words": 0, "hypothesis_words": 0,
+    "source_audio_s": 0.0, "rtf": None, "x_realtime": None,
+    "audio_s_per_s": None, "words_per_s": None,
+    "hypothesis_tokens": None, "hypothesis_tokens_per_s_e2e": None,
+    "token_throughput_semantics": "unavailable: exact model tokenizer not invoked",
   }
 
   if proc.returncode != 0:
@@ -628,17 +778,24 @@ def run_combo(
       {
         "status": "failed",
         "missing": len(manifest),
-        "avg_wer": 1.0,
+        "macro_wer": None,
       },
     )
     base_row.update(trace_metadata)
+    failures = [{"item_id": audio.stem, "kind": "child_process_exit", "returncode": proc.returncode} for audio, _ in manifest]
+    (run_root / "failures.jsonl").write_text("".join(json.dumps(item) + "\n" for item in failures), encoding="utf-8")
+    (run_root / "command.txt").write_text(" ".join(__import__("shlex").quote(x) for x in redact_command(cmd)) + "\n", encoding="utf-8")
+    failed_summary = {**base_row, "child_returncode": proc.returncode, "integrity": {"missing": [a.stem for a, _ in manifest], "unexpected": [], "duplicates": [], "empty_hypotheses": []}}
+    (run_root / "summary.json").write_text(json.dumps(failed_summary, indent=2) + "\n", encoding="utf-8")
+    (run_root / "summary.md").write_text(f"# Benchmark summary\n\n- Status: failed\n- Child return code: {proc.returncode}\n- Missing outputs: {len(manifest)}\n", encoding="utf-8")
     return base_row
 
-  wer_scores: List[float] = []
-  input_token_pairs: List[Tuple[int, float]] = []
-  decode_token_pairs: List[Tuple[int, float]] = []
-  encode_token_pairs: List[Tuple[int, float]] = []
+  score_pairs: List[Tuple[List[str], List[str]]] = []
+  source_audio_s = 0.0
   missing = 0
+  empty_ids: List[str] = []
+  hypotheses: List[str] = []
+  failures: List[Dict[str, object]] = []
 
   score_format = args.score_format
   if args.output_format == "all" and score_format not in {"txt", "json"}:
@@ -647,7 +804,7 @@ def run_combo(
       {
         "status": "partial",
         "missing": len(manifest),
-        "avg_wer": 1.0,
+        "macro_wer": None,
       },
     )
     base_row.update(trace_metadata)
@@ -656,59 +813,89 @@ def run_combo(
     score_format = args.output_format
 
   for audio, ref in manifest:
+    try:
+      source_audio_s += args.duration_by_path[str(audio)]
+    except ValueError as exc:
+      failures.append({"item_id": audio.stem, "kind": "invalid_duration", "detail": str(exc)})
+      continue
     pred_txt = build_score_path(output_root, audio.stem, score_format)
     if not pred_txt.exists():
       missing += 1
+      failures.append({"item_id": audio.stem, "kind": "missing_output"})
       continue
     pred = ""
-    pred_tokens = 0
-    pred_audio_s = 0.0
     if score_format == "json":
-      pred, pred_tokens, pred_audio_s = parse_json_prediction_with_metrics(pred_txt)
+      try:
+        json.loads(pred_txt.read_text(encoding="utf-8", errors="ignore"))
+      except (OSError, json.JSONDecodeError) as exc:
+        missing += 1
+        failures.append({"item_id": audio.stem, "kind": "invalid_output", "detail": str(exc)})
+        continue
+      pred = parse_json_prediction(pred_txt)
     else:
       pred = load_prediction_text(pred_txt, score_format)
-      pred_tokens = len(normalize(pred))
     if not pred.strip():
       missing += 1
+      empty_ids.append(audio.stem)
+      failures.append({"item_id": audio.stem, "kind": "empty_hypothesis"})
       continue
+    score_pairs.append((normalize(ref), normalize(pred)))
+    hypotheses.append(pred)
 
-    ref_tokens = len(normalize(ref))
-    if ref_tokens > 0:
-      input_token_pairs.append((ref_tokens, pred_audio_s))
-    if pred_tokens > 0:
-      decode_token_pairs.append((pred_tokens, pred_audio_s))
-    if pred_tokens > 0:
-      encode_token_pairs.append((pred_tokens, pred_audio_s))
-
-    wer_scores.append(wer(ref, pred))
-
-  if not wer_scores:
-    avg = 1.0
-  else:
-    avg = sum(wer_scores) / len(wer_scores)
-
-  input_rate_avg, input_rate_peak = compute_token_rate_stats(input_token_pairs, runtime)
-  decode_rate_avg, decode_rate_peak = compute_token_rate_stats(decode_token_pairs, runtime)
-  encode_rate_avg, encode_rate_peak = compute_token_rate_stats(encode_token_pairs, runtime)
+  produced = [p.stem for p in output_root.rglob(f"*.{score_format}")]
+  integrity = validate_output_ids([a.stem for a, _ in manifest], produced, empty_ids)
+  for kind in ("unexpected", "duplicates"):
+    failures.extend({"item_id": item, "kind": kind.rstrip("s")} for item in integrity[kind])
+  scores = aggregate_scores(score_pairs)
+  hypothesis_tokens, token_semantics = count_final_hypothesis_tokens(hypotheses, str(args.transcribe_config), run_root)
+  timing = throughput(source_audio_s, runtime, int(scores["hypothesis_words"]), hypothesis_tokens) if source_audio_s > 0 and runtime > 0 else {}
+  timing["hypothesis_tokens_per_s_transcribe"] = timing.get("hypothesis_tokens_per_s_e2e")
+  status = "ok" if not failures and len(score_pairs) == len(manifest) else "failed"
+  with (run_root / "failures.jsonl").open("w", encoding="utf-8") as stream:
+    for failure in failures:
+      stream.write(json.dumps(failure, sort_keys=True) + "\n")
+  (run_root / "command.txt").write_text(" ".join(__import__("shlex").quote(x) for x in redact_command(cmd)) + "\n", encoding="utf-8")
   base_row.update(
     {
-      "status": "ok" if missing == 0 else "partial",
+      "status": status,
       "missing": missing,
-      "avg_wer": avg,
-      "input_toks_per_sec_avg": input_rate_avg,
-      "input_toks_per_sec_peak": input_rate_peak,
-      "decode_toks_per_sec_avg": decode_rate_avg,
-      "decode_toks_per_sec_peak": decode_rate_peak,
-      "encode_toks_per_sec_avg": encode_rate_avg,
-      "encode_toks_per_sec_peak": encode_rate_peak,
+      **scores, **timing, "token_throughput_semantics": token_semantics,
     },
   )
   base_row.update(trace_metadata)
+  limitations = [
+    "End-to-end timing only; runtime stage boundaries unavailable.",
+    "Transcript truncation cannot be inferred reliably from generated timestamps; output membership, parseability, and non-empty text are enforced.",
+  ]
+  if hypothesis_tokens is None:
+    limitations.append("Exact final-hypothesis tokenizer throughput unavailable and not estimated.")
+  summary = {**base_row, "integrity": integrity, "limitations": limitations}
+  (run_root / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+  (run_root / "summary.md").write_text(
+    "# Benchmark summary\n\n"
+    f"- Status: {status}\n- Files: {len(manifest)}\n- Source audio: {source_audio_s:.3f} s\n"
+    f"- Dataset: {dataset}\n- Mode: {dataset_mode}\n- Model / compute: {base_row['model']} / {base_row['compute_type']}\n"
+    f"- Alignment / diarization: {base_row['alignment_enabled']} / {base_row['diarization_enabled']}\n"
+    f"- Batch / beam / GPUs: {base_row['batch_size']} / {base_row['beam_size']} / {gpu_filter}\n"
+    f"- Corpus WER: {scores['corpus_wer']}\n- Macro WER: {scores['macro_wer']}\n"
+    f"- S/D/I/H: {scores['substitutions']}/{scores['deletions']}/{scores['insertions']}/{scores['hits']}\n"
+    f"- End-to-end RTF: {timing.get('rtf')}\n- x realtime: {timing.get('x_realtime')}\n"
+    f"- Words/s: {timing.get('words_per_s')}\n- Final-hypothesis tokens/s: {timing.get('hypothesis_tokens_per_s_e2e')}\n"
+    f"- Token semantics: {token_semantics}\n"
+    f"- Missing outputs: {missing}\n\n## Limitations\n\n"
+    "Only end-to-end timing is available; runtime stages are not inferred. "
+    "Truncation cannot be inferred reliably from generated timestamps; membership, parseability, and non-empty text are enforced.\n",
+    encoding="utf-8",
+  )
   return base_row
 
 
 def run() -> int:
   args = apply_defaults(parse_args())
+  transcribe_path = Path(args.transcribe).expanduser()
+  if not transcribe_path.is_absolute():
+    transcribe_path = transcribe_path.resolve()
+  args.transcribe = str(transcribe_path)
   dataset = Path(args.dataset).resolve()
   output_root = Path(args.output_root).resolve()
   output_root.mkdir(parents=True, exist_ok=True)
@@ -730,17 +917,12 @@ def run() -> int:
     )
     return 2
 
-  if args.ext != "wav":
-    print("ERROR: this harness currently supports only wav input.", file=sys.stderr)
-    return 2
-
   manifest = build_manifest(dataset, args.ext, references, args.max_files)
   if not manifest:
-    wav_count = len(list(dataset.rglob("*.wav")))
-    if wav_count == 0:
+    audio_count = len(list(dataset.rglob(f"*.{args.ext}")))
+    if audio_count == 0:
       print(
-        "ERROR: no WAV files found. Run dataset conversion first (for example: "
-        "python scripts/convert_flac_to_wav.py --root <dataset>), then re-run benchmark.",
+        f"ERROR: no {args.ext.upper()} files found.",
         file=sys.stderr,
       )
       return 2
@@ -748,6 +930,27 @@ def run() -> int:
   if not manifest:
     print(f"ERROR: no files with references found in {dataset}", file=sys.stderr)
     return 2
+
+  duration_by_path: Dict[str, float] = {}
+  invalid_media: List[str] = []
+  for audio, _ in manifest:
+    try:
+      duration_by_path[str(audio)] = probe_duration(audio)
+    except ValueError as exc:
+      invalid_media.append(str(exc))
+  if invalid_media:
+    print("ERROR: invalid or zero-duration media:\n" + "\n".join(invalid_media), file=sys.stderr)
+    return 2
+  args.duration_by_path = duration_by_path
+  if args.manifest_only:
+    items = [{"item_id": audio.stem, "audio_path": str(audio), "reference": ref, "duration_s": duration_by_path[str(audio)]} for audio, ref in manifest]
+    canonical = json.dumps(items, sort_keys=True, separators=(",", ":"))
+    payload = {"schema_version": 1, "dataset": str(dataset), "extension": args.ext, "items": items,
+      "file_count": len(items), "total_source_audio_s": sum(duration_by_path.values()),
+      "manifest_sha256": hashlib.sha256(canonical.encode()).hexdigest()}
+    (output_root / "manifest.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    print(f"Manifest validated: files={len(items)} audio_s={payload['total_source_audio_s']:.3f} sha256={payload['manifest_sha256']}")
+    return 0
 
   fixed = parse_kv_items(args.set, allow_multiple=False)
   sweep = parse_kv_items(args.sweep, allow_multiple=True)
@@ -793,17 +996,14 @@ def run() -> int:
     "run_id",
     "status",
     "runtime_s",
-    "input_toks_per_sec_avg",
-    "input_toks_per_sec_peak",
-    "decode_toks_per_sec_avg",
-    "decode_toks_per_sec_peak",
-    "encode_toks_per_sec_avg",
-    "encode_toks_per_sec_peak",
+    "corpus_wer", "macro_wer", "substitutions", "deletions", "insertions", "hits",
+    "reference_words", "hypothesis_words", "source_audio_s", "rtf", "x_realtime",
+    "audio_s_per_s", "words_per_s", "hypothesis_tokens", "hypothesis_tokens_per_s_e2e", "hypothesis_tokens_per_s_transcribe",
+    "token_throughput_semantics",
     "files_per_second",
     "seconds_per_file",
     "num_files",
     "missing",
-    "avg_wer",
   ] + param_names
   if args.trace:
     field_names += trace_fields
@@ -813,21 +1013,16 @@ def run() -> int:
     writer.writeheader()
     for row in results:
       out = {k: row.get(k, "") for k in field_names}
-      out["avg_wer"] = f"{float(out['avg_wer']):.6f}"
       out["runtime_s"] = f"{float(out['runtime_s']):.3f}"
-      out["input_toks_per_sec_avg"] = f"{float(out['input_toks_per_sec_avg']):.3f}"
-      out["input_toks_per_sec_peak"] = f"{float(out['input_toks_per_sec_peak']):.3f}"
-      out["decode_toks_per_sec_avg"] = f"{float(out['decode_toks_per_sec_avg']):.3f}"
-      out["decode_toks_per_sec_peak"] = f"{float(out['decode_toks_per_sec_peak']):.3f}"
-      out["encode_toks_per_sec_avg"] = f"{float(out['encode_toks_per_sec_avg']):.3f}"
-      out["encode_toks_per_sec_peak"] = f"{float(out['encode_toks_per_sec_peak']):.3f}"
+      for key in ("corpus_wer", "macro_wer", "source_audio_s", "rtf", "x_realtime", "audio_s_per_s", "words_per_s"):
+        out[key] = "" if out[key] is None else f"{float(out[key]):.6f}"
       out["files_per_second"] = f"{float(out['files_per_second']):.3f}"
       out["seconds_per_file"] = f"{float(out['seconds_per_file']):.3f}"
       writer.writerow(out)
 
   best = sorted(
     [r for r in results if r["status"] in ("ok", "partial")],
-    key=lambda r: (r["avg_wer"], r["missing"], r["runtime_s"]),
+    key=lambda r: (r["corpus_wer"] if r["corpus_wer"] is not None else float("inf"), r["missing"], r["runtime_s"]),
   )
   if best:
     best_entry = best[0]
@@ -836,9 +1031,9 @@ def run() -> int:
   print(f"Results written to: {results_csv}")
   print(
     "Best run: "
-    f"{best_entry['run_id']} avg_wer={best_entry['avg_wer']:.6f} missing={best_entry['missing']} status={best_entry['status']}"
+    f"{best_entry['run_id']} corpus_wer={best_entry.get('corpus_wer')} macro_wer={best_entry.get('macro_wer')} missing={best_entry['missing']} status={best_entry['status']}"
   )
-  return 0
+  return 0 if all(row.get("status") == "ok" for row in results) else 1
 
 
 if __name__ == "__main__":

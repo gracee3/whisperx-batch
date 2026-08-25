@@ -51,3 +51,9 @@ sweep axis.
 Known Boolean toggles become present/absent flags. Other Boolean-looking values
 remain key/value arguments because WhisperX has options whose Boolean state is
 encoded as text.
+
+The benchmark accepts `--ext flac` and this is the preferred LibriSpeech path;
+conversion to WAV is unnecessary. Benchmark output is failed when its manifest
+and scored output membership differ. The Docker child never receives inherited
+stdin, preserving multi-file iteration even when the parent is itself driven by
+a pipe or null-delimited loop.

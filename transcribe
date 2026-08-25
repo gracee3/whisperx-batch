@@ -413,7 +413,6 @@ def build_docker_run_command(
     "docker",
     "run",
     "--rm",
-    "--interactive",
     "--pull",
     pull_policy,
     "-u",
@@ -466,7 +465,7 @@ def build_docker_run_command(
 
 
 def execute_docker(cmd: List[str]) -> int:
-  proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+  proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
   if proc.returncode != 0:
     if proc.stdout:
       print(proc.stdout)
