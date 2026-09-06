@@ -123,8 +123,10 @@ GPU, model, dataset, audio file, or network.
 
 ## Benchmarks
 
-`whisperx-benchmark` supports Cartesian parameter sweeps, LibriSpeech-style
-references, run-level CSV results, and optional `nvidia-smi` traces. A benchmark
+`whisperx-benchmark` supports original LibriSpeech FLAC input, Cartesian
+parameter sweeps, corpus and macro WER with S/D/I/H counts, source-duration-based
+RTF and x-realtime throughput, strict output accounting, run manifests, CSV/JSON
+results, and optional `nvidia-smi` traces. A benchmark
 is publishable evidence only when it records the repository commit, image
 digest, dependency/model/corpus revisions, exact config and command, hardware
 context, repetitions, correctness result, resource measurements, failures, and
@@ -137,6 +139,22 @@ maintainer observation from a 200-file LibriSpeech `dev-clean` RTX 3090 sweep on
 present that observation as a reproducible comparative result.
 
 See [Benchmark publication](docs/BENCHMARKING.md).
+
+Prepare and verify the four official evaluation subsets explicitly (never as a
+test prerequisite):
+
+```bash
+make dataset-setup
+make dataset-verify
+python3 scripts/build_librispeech_longform.py \
+  --source /data/datasets/LibriSpeech/dev-clean \
+  --destination /data/datasets/LibriSpeech-longform/dev-clean
+```
+
+`corpus_wer` is the primary word-error metric; `macro_wer` is the mean of
+per-file WERs. `rtf` is wall time divided by source audio time, while
+`x_realtime` is its inverse. Words are never called tokens: exact tokenizer
+throughput is left unavailable unless the exact model tokenizer is invoked.
 
 ## Privacy and limitations
 

@@ -18,7 +18,9 @@ changes.
   and starts Docker.
 - `whisperx-benchmark` builds public-corpus manifests, expands parameter sweeps,
   calls `transcribe`, scores output, and optionally samples `nvidia-smi`.
-- `benchmark_utils.py` owns fixed/sweep option parsing and Boolean flag mapping.
+- `benchmark_utils.py` owns fixed/sweep option parsing and Boolean flag mapping;
+  `benchmark_core.py` owns offline scoring, timing formulas, manifest hashes,
+  integrity inventories, repetition statistics, and deterministic sharding.
 - `scripts/` contains explicit dataset, cache, conversion, and cleaning helpers;
   none run as an implicit prerequisite.
 

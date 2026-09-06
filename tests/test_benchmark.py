@@ -200,6 +200,12 @@ class BenchmarkCommandTests(unittest.TestCase):
       (10.0, 10.0),
     )
 
+  def test_recorded_command_redacts_credentials(self) -> None:
+    self.assertEqual(
+      BENCHMARK.redact_command(["tool", "--hf-token", "hf_private", "--value", "safe", "sk-secret"]),
+      ["tool", "--hf-token", "<redacted>", "--value", "safe", "<redacted>"],
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -25,7 +25,7 @@ root = "/path/to/datasets/LibriSpeech"
 subset = "dev-clean"
 url = "https://www.openslr.org/resources/12/dev-clean.tar.gz"
 archive = "dev-clean.tar.gz"
-convert_to_wav = true
+convert_to_wav = false
 convert_num_proc = 8
 ffmpeg_threads = 0
 keep_archive = true
@@ -34,7 +34,7 @@ convert_if_missing_only = false
 [benchmark]
 dataset = "/path/to/datasets/LibriSpeech/dev-clean"
 transcribe = "transcribe"
-ext = "wav"
+ext = "flac"
 output_root = "./benchmark-output"
 output_format = "json"
 score_format = "json"

@@ -189,7 +189,8 @@ class TranscribeControlPlaneTests(unittest.TestCase):
         whisper_output_dir="/mnt/output",
         whisper_input_container_dir="/mnt/input",
       )
-      self.assertEqual(cmd[:5], ["docker", "run", "--rm", "--interactive", "--pull"])
+      self.assertEqual(cmd[:4], ["docker", "run", "--rm", "--pull"])
+      self.assertNotIn("--interactive", cmd)
       self.assertIn("device=1", cmd)
       self.assertIn(f"{model.resolve()}:{model.resolve()}:ro", cmd)
       self.assertIn(f"{audio.resolve()}:/mnt/input/audio.wav:ro", cmd)
@@ -224,6 +225,12 @@ class TranscribeControlPlaneTests(unittest.TestCase):
       fallback = execute.call_args_list[1].args[0][-1]
       self.assertNotIn("--diarize", fallback)
       self.assertNotIn("diarize_model", fallback)
+
+  def test_execute_docker_never_inherits_stdin(self) -> None:
+    completed = mock.Mock(returncode=0, stdout="")
+    with mock.patch.object(TRANSCRIBE.subprocess, "run", return_value=completed) as run:
+      self.assertEqual(TRANSCRIBE.execute_docker(["docker", "run"]), 0)
+    self.assertIs(run.call_args.kwargs["stdin"], TRANSCRIBE.subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

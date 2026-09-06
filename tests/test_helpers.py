@@ -23,6 +23,10 @@ SETUP_DATASET = load_entrypoint(
   "scripts/setup_librispeech_dataset.py",
   "whisperx_batch_setup_dataset_test",
 )
+LONGFORM = load_entrypoint(
+  "scripts/build_librispeech_longform.py",
+  "whisperx_batch_longform_test",
+)
 
 
 class HelperScriptTests(unittest.TestCase):
@@ -108,6 +112,28 @@ class HelperScriptTests(unittest.TestCase):
       self.assertFalse(PRESEED.marker_exists(root))
       (english / "abbrev_types.txt").write_text("ok", encoding="utf-8")
       self.assertTrue(PRESEED.marker_exists(root))
+
+  def test_longform_chapter_and_utterance_order_is_deterministic(self) -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+      root = Path(temp_dir)
+      chapter_b = root / "2" / "9"
+      chapter_a = root / "1" / "3"
+      chapter_b.mkdir(parents=True)
+      chapter_a.mkdir(parents=True)
+      for path in (chapter_b / "2-9-0002.flac", chapter_a / "1-3-0001.flac", chapter_b / "2-9-0001.flac"):
+        path.write_bytes(b"fixture")
+      groups = LONGFORM.chapter_groups(root)
+      self.assertEqual([key for key, _ in groups], ["1-3", "2-9"])
+      self.assertEqual([p.stem for p in groups[1][1]], ["2-9-0001", "2-9-0002"])
+
+  def test_longform_reference_loading_supports_stitching_order(self) -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+      root = Path(temp_dir)
+      path = root / "1-2.trans.txt"
+      path.write_text("1-2-0002 SECOND\n1-2-0001 FIRST\n", encoding="utf-8")
+      refs = LONGFORM.load_references(root)
+      ordered = ["1-2-0001", "1-2-0002"]
+      self.assertEqual(" ".join(refs[key] for key in ordered), "FIRST SECOND")
 
 
 class RepositoryBaselineTests(unittest.TestCase):
