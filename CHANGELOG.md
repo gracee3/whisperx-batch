@@ -4,6 +4,9 @@ This file separates historical stack checkpoints from current unreleased work.
 
 ## Unreleased
 
+- Detached Docker transcription from the caller's standard input so shell
+  loops can process every queued file without Docker consuming the remaining
+  input records.
 - Added the repository's intended MIT license and dependency/data provenance
   boundaries.
 - Replaced tracked personal host paths with a portable `config.example.toml` and

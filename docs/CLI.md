@@ -31,6 +31,9 @@ input hashes, config identity, or model identity.
 
 ## Docker boundary
 
+- Docker receives no inherited standard input and runs without interactive
+  mode. This preserves the remaining records when a caller drives transcription
+  from a pipe or a shell loop.
 - Input files and discovered model/alignment/diarization directories are
   mounted read-only.
 - The output directory and cache root are writable.
